@@ -1,16 +1,17 @@
-import numpy as np
+from flask import Flask, request, jsonify
 import pandas as pd
+import numpy as np
+import joblib
 import json
-from sklearn.preprocessing import MinMaxScaler
-from xgboost import XGBRegressor
 from datetime import datetime, timedelta
 import google.generativeai as genai
-import joblib
-from sklearn.model_selection import train_test_split
 
-def mean_absolute_percentage_error(y_true, y_pred):
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    return np.mean(np.abs((y_true - y_pred) / np.maximum(np.ones(len(y_true)), np.abs(y_true)))) * 100
+app = Flask(__name__)
+
+# Load model dan scaler saat server start
+model = joblib.load('sales_model.joblib')
+scaler = joblib.load('sales_scaler.joblib')
+WINDOW = 30
 
 def create_windows(data, window_size):
     X, y = [], []
@@ -101,60 +102,48 @@ def get_gemini_analysis(historical_df, predictions_json):
     
     return "Gagal mendapatkan analisis"
 
-# 1. Load new data
-df = pd.read_csv('data baru euy.csv')
-df = df.copy()[['date', 'total_sales']]
-df['date'] = pd.to_datetime(df['date'])
-df.set_index('date', inplace=True)
+@app.route('/predict', methods=['POST'])
+def predict():
+    if 'file' not in request.files:
+        return jsonify({'error': 'File CSV tidak ditemukan'}), 400
+    
+    file = request.files['file']
+    df = pd.read_csv(file)
+    
+    try:
+        df = df.copy()[['date', 'total_sales']]
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
 
-# 2. Remove outliers (1% lowest and highest)
-q_low, q_high = df['total_sales'].quantile([0.01, 0.99])
-df = df[(df['total_sales'] > q_low) & (df['total_sales'] < q_high)]
+        q_low, q_high = df['total_sales'].quantile([0.01, 0.99])
+        df = df[(df['total_sales'] > q_low) & (df['total_sales'] < q_high)]
 
-# 3. Load existing model and scaler
-model = joblib.load('sales_model.joblib')
-scaler = joblib.load('sales_scaler.joblib')
+        scaled = scaler.transform(df[['total_sales']])
+        X, y = create_windows(scaled, WINDOW)
 
-# 4. Scale new data
-scaled = scaler.transform(df[['total_sales']])
+        model.fit(X, y, eval_set=[(X, y)], verbose=False)
 
-# 5. Create sequences with window size 30
-WINDOW = 30
-X, y = create_windows(scaled, WINDOW)
+        last_win = scaled[-WINDOW:, 0]
+        future_scaled = forecast_future(model, last_win, 30)
+        future_preds = scaler.inverse_transform(future_scaled.reshape(-1, 1)).flatten()
+        future_dates = pd.date_range(start=df.index[-1] + pd.Timedelta(days=1), periods=30)
 
-# 6. Retrain model with new data
-model.fit(
-    X, y,
-    eval_set=[(X, y)],
-    verbose=False
-)
+        predictions_dict = {
+            str(date.date()): {"total_sales": float(sales)}
+            for date, sales in zip(future_dates, future_preds)
+        }
 
-# Save updated model
-joblib.dump(model, 'sales_model.joblib')
+        historical_data = df.tail(30)
+        gemini_recommendation = get_gemini_analysis(historical_data, predictions_dict)
 
-# 7. Forecast next 30 days
-last_win = scaled[-WINDOW:, 0]
-future_steps = 30
-future_scaled = forecast_future(model, last_win, future_steps)
-future_preds = scaler.inverse_transform(future_scaled.reshape(-1, 1)).flatten()
+        result = {
+            "predictions": predictions_dict,
+            "analysis": gemini_recommendation
+        }
 
-future_dates = pd.date_range(start=df.index[-1] + pd.Timedelta(days=1), periods=future_steps)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-# Create predictions dictionary
-predictions_dict = {
-    str(date.date()): {"total_sales": float(sales)}
-    for date, sales in zip(future_dates, future_preds)
-}
-
-# Get Gemini analysis
-historical_data = df.tail(30)
-gemini_recommendation = get_gemini_analysis(historical_data, predictions_dict)
-
-# Prepare final output
-output_data = {
-    "predictions": predictions_dict,
-    "analysis": gemini_recommendation
-}
-
-# Output only the JSON
-print(json.dumps(output_data, indent=4, ensure_ascii=False))
+if __name__ == '__main__':
+    app.run(debug=True)
