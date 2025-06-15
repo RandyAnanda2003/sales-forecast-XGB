@@ -130,10 +130,10 @@ def predict():
             n_estimators=120,
             learning_rate=0.05,
             max_depth=3,
-            subsample=0.9,
+            subsample=0.7,
             colsample_bytree=0.8,
             random_state=42,
-            min_child_weight=10,
+            min_child_weight=5,
             gamma=0
         )
         model.fit(X, y)
